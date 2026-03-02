@@ -4,6 +4,7 @@
 
 use std::array::from_ref;
 use std::cell::{Cell, RefCell};
+use std::cmp::Ordering;
 use std::f64::consts::PI;
 use std::mem;
 use std::rc::Rc;
@@ -1685,13 +1686,11 @@ impl DocumentEventHandler {
         }
     }
 
-    pub(crate) fn run_default_keyboard_event_handler(&self, event: &KeyboardEvent) {
+    pub(crate) fn run_default_keyboard_event_handler(&self, event: &KeyboardEvent, can_gc: CanGc) {
         if event.upcast::<Event>().type_() != atom!("keydown") {
             return;
         }
-        if !event.modifiers().is_empty() {
-            return;
-        }
+
         let scroll = match event.key() {
             Key::Named(NamedKey::ArrowDown) => KeyboardScroll::Down,
             Key::Named(NamedKey::ArrowLeft) => KeyboardScroll::Left,
@@ -1701,9 +1700,113 @@ impl DocumentEventHandler {
             Key::Named(NamedKey::Home) => KeyboardScroll::Home,
             Key::Named(NamedKey::PageDown) => KeyboardScroll::PageDown,
             Key::Named(NamedKey::PageUp) => KeyboardScroll::PageUp,
+            Key::Named(NamedKey::Tab) => {
+                self.do_tab_navigation(event, can_gc);
+                return;
+            },
             _ => return,
         };
-        self.do_keyboard_scroll(scroll);
+
+        if event.modifiers().is_empty() {
+            self.do_keyboard_scroll(scroll);
+        }
+    }
+
+    pub(crate) fn do_tab_navigation(&self, event: &KeyboardEvent, can_gc: CanGc) {
+        let focus_direction = if event.modifiers().contains(Modifiers::SHIFT) {
+            FocusDirection::Backward
+        } else {
+            FocusDirection::Forward
+        };
+
+        if let Some(element) = self.find_element_for_tab_focus(focus_direction) {
+            let document = self.window.Document();
+            document.begin_focus_transaction();
+
+            // Try to focus `el`. If it's not focusable, focus the document instead.
+            document.request_focus(None, FocusInitiator::Local, can_gc);
+            document.request_focus(Some(&*element), FocusInitiator::Local, can_gc);
+
+            // Step 8. If result is true and target is a focusable area
+            // that is click focusable, then Run the focusing steps at target.
+            assert!(document.has_focus_transaction());
+            document.commit_focus_transaction(FocusInitiator::Local, can_gc);
+        }
+    }
+
+    fn find_element_for_tab_focus(&self, direction: FocusDirection) -> Option<DomRoot<Element>> {
+        let document = self.window.Document();
+        let root_node = document.GetDocumentElement()?;
+        // TODO: Do something better here.
+        let focused_element = document.get_focused_element()?;
+        let focused_element_tab_index = focused_element.tab_index();
+
+        let mut winning_node_and_tab_index: Option<(DomRoot<Element>, i32)> = None;
+        let mut saw_focused_element = false;
+        for node in root_node
+            .upcast::<Node>()
+            .traverse_preorder(ShadowIncluding::Yes)
+        {
+            let Some(element) = DomRoot::downcast(node) else {
+                continue;
+            };
+            if element == focused_element {
+                saw_focused_element = true;
+                continue;
+            }
+
+            let element_tab_index = element.tab_index();
+            if !element.is_keyboard_focusable() {
+                continue;
+            }
+
+            println!("element: {element:?}: {element_tab_index:?}");
+            let compare_tab_indices = |a: i32, b: i32| {
+                if a == b {
+                    Ordering::Equal
+                } else if a == 0 {
+                    Ordering::Greater
+                } else if b == 0 {
+                    Ordering::Less
+                } else {
+                    a.cmp(&b)
+                }
+            };
+
+            let ordering = compare_tab_indices(focused_element_tab_index, element_tab_index);
+            if direction == FocusDirection::Forward {
+                if saw_focused_element && ordering == Ordering::Equal {
+                    return Some(element);
+                }
+                if ordering != Ordering::Less {
+                    continue;
+                }
+                let Some((_, winning_tab_index)) = winning_node_and_tab_index else {
+                    winning_node_and_tab_index = Some((element, element_tab_index));
+                    continue;
+                };
+                if compare_tab_indices(element_tab_index, winning_tab_index) == Ordering::Less {
+                    winning_node_and_tab_index = Some((element, element_tab_index))
+                }
+            } else {
+                if !saw_focused_element && ordering == Ordering::Equal {
+                    winning_node_and_tab_index = Some((element, element_tab_index));
+                    continue;
+                }
+                if ordering != Ordering::Greater {
+                    continue;
+                }
+                let Some((_, winning_tab_index)) = winning_node_and_tab_index else {
+                    winning_node_and_tab_index = Some((element, element_tab_index));
+                    continue;
+                };
+                if compare_tab_indices(element_tab_index, winning_tab_index) != Ordering::Less {
+                    winning_node_and_tab_index = Some((element, element_tab_index))
+                }
+            }
+        }
+
+        winning_node_and_tab_index.map(|pair| pair.0)
     }
 
     pub(crate) fn do_keyboard_scroll(&self, scroll: KeyboardScroll) {
@@ -1833,4 +1936,10 @@ impl DocumentEventHandler {
             .min()
             .is_some_and(|primary_pointer| *primary_pointer == pointer_id)
     }
+}
+
+#[derive(PartialEq)]
+enum FocusDirection {
+    Forward,
+    Backward,
 }
