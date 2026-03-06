@@ -93,6 +93,12 @@ use crate::http_cache::{
 use crate::resource_thread::{AuthCache, AuthCacheEntry};
 use crate::websocket_loader::start_websocket;
 
+
+use crate::adblock_engine::AdBlockEngine;
+use crate::adblock_config::AdBlockConfig;
+use crate::adblock_stats::AdBlockStats;
+
+
 /// The various states an entry of the HttpCache can be in.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HttpCacheEntryState {
@@ -113,6 +119,9 @@ pub struct HttpState {
     pub client: ServoClient,
     pub override_manager: CertificateErrorOverrideManager,
     pub embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
+
+    pub adblock_engine: StdArc<AdBlockEngine>,
+    pub adblock_stats: StdArc<AdBlockStats>,
 }
 
 impl HttpState {
@@ -154,6 +163,65 @@ impl HttpState {
                 sender,
             ));
         receiver.await.ok()?
+    }
+
+/// Initialise le moteur AdBlock
+    pub fn init_adblock_engine() -> (StdArc<AdBlockEngine>, StdArc<AdBlockStats>) {
+        use std::path::Path;
+        
+        let config_path = Path::new("resources/adblock/config.json").to_path_buf();
+        let config = AdBlockConfig::load_or_default(&config_path);
+        
+        let mut engine = AdBlockEngine::new();
+        engine.set_enabled(config.enabled);
+        
+        let filter_paths: Vec<&Path> = config.filter_lists
+            .iter()
+            .filter(|p| p.exists())
+            .map(|p| p.as_path())
+            .collect();
+        
+        if !filter_paths.is_empty() {
+            match engine.load_filters_from_files(&filter_paths) {
+                Ok(count) => {
+                    info!("AdBlock: {} règles de blocage chargées", count);
+                }
+                Err(e) => {
+                    warn!("AdBlock: Impossible de charger les filtres: {}", e);
+                    engine.set_enabled(false);
+                }
+            }
+        } else {
+            warn!("AdBlock: Aucune liste trouvée");
+            engine.set_enabled(false);
+        }
+        
+        (StdArc::new(engine), StdArc::new(AdBlockStats::new()))
+    }
+    
+    pub fn should_block_request(
+        &self,
+        url: &str,
+        source_url: Option<&str>,
+        request_type: &str,
+    ) -> bool {
+        if !self.adblock_engine.is_enabled() {
+            return false;
+        }
+        
+        let should_block = self.adblock_engine.should_block(
+            url,
+            source_url.unwrap_or(""),
+            request_type,
+        );
+        
+        if should_block {
+            self.adblock_stats.record_blocked(url, request_type);
+        } else {
+            self.adblock_stats.record_allowed(url, request_type);
+        }
+        
+        should_block
     }
 }
 
@@ -2016,6 +2084,29 @@ async fn http_network_fetch(
 
     // Step 1: Let request be fetchParams’s request.
     let request = &mut fetch_params.request;
+
+    {
+        let url = request.current_url();
+        let source_url = request.referrer.to_url().map(|u| u.as_str());
+        
+        let request_type = match request.destination {
+            Destination::Script => "script",
+            Destination::Image => "image",
+            Destination::Style => "stylesheet",
+            Destination::Font => "font",
+            Destination::Document | Destination::Frame | Destination::IFrame => "document",
+            Destination::Audio | Destination::Video => "media",
+            Destination::Worker => "script",
+            Destination::Json => "xmlhttprequest",
+            _ => "other",
+        };
+        
+        if context.state.should_block_request(url.as_str(), source_url, request_type) {
+            info!("🚫 AdBlock: Blocked - {} ({})", url, request_type);
+            return Response::network_error(NetworkError::AdBlockBlocked);
+        }
+        debug!("✅ AdBlock: Autorised - {}", url);
+    }
 
     // Step 2
     // TODO be able to create connection using current url's origin and credentials

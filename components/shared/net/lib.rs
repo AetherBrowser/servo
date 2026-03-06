@@ -1197,6 +1197,9 @@ pub enum NetworkError {
     BlobURLStoreError(String),
     HttpError(String),
     DecompressionError,
+
+
+    AdBlockBlocked,
 }
 
 impl fmt::Debug for NetworkError {
@@ -1245,6 +1248,8 @@ impl fmt::Debug for NetworkError {
             },
             NetworkError::HttpError(s) => write!(f, "HTTP failure: {}", s),
             NetworkError::DecompressionError => write!(f, "Decompression error"),
+
+            NetworkError::AdBlockBlocked => write!(f, "Blocked by adblock"),
         }
     }
 }
