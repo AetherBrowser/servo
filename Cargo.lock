@@ -4721,6 +4721,7 @@ dependencies = [
  "servo-media",
  "servo-media-dummy",
  "servo-media-gstreamer",
+ "servo-media-mpv",
  "servo-media-thread",
  "servo-net",
  "servo-net-traits",
@@ -8066,6 +8067,22 @@ dependencies = [
  "gstreamer-video",
  "servo-media-gstreamer-render",
  "servo-media-player",
+]
+
+[[package]]
+name = "servo-media-mpv"
+version = "0.0.1"
+dependencies = [
+ "ipc-channel",
+ "libc",
+ "log",
+ "servo-media",
+ "servo-media-audio",
+ "servo-media-dummy",
+ "servo-media-player",
+ "servo-media-streams",
+ "servo-media-traits",
+ "servo-media-webrtc",
 ]
 
 [[package]]
