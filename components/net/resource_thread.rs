@@ -204,6 +204,7 @@ fn create_http_states(
 
     let override_manager = CertificateErrorOverrideManager::new();
     let (adblock_engine, adblock_stats) = HttpState::init_adblock_engine();
+    let tracker_poisoner = HttpState::init_tracker_poisoner();
     let http_state = HttpState {
         hsts_list: RwLock::new(hsts_list),
         cookie_jar: RwLock::new(cookie_jar),
@@ -219,6 +220,7 @@ fn create_http_states(
         embedder_proxy: embedder_proxy.clone(),
         adblock_engine: adblock_engine.clone(),
         adblock_stats: adblock_stats.clone(),
+        tracker_poisoner: tracker_poisoner.clone(),
     };
 
     let override_manager = CertificateErrorOverrideManager::new();
@@ -239,6 +241,7 @@ fn create_http_states(
         embedder_proxy,
         adblock_engine: adblock_engine.clone(),
         adblock_stats: adblock_stats.clone(),
+        tracker_poisoner: tracker_poisoner.clone(),
     };
 
     (Arc::new(http_state), Arc::new(private_http_state))

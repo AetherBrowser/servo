@@ -16,11 +16,17 @@ pub struct AdBlockStats {
     /// Nombre total de requêtes autorisées
     pub allowed_requests: AtomicU64,
     
+    /// Nombre total de requêtes empoisonnées (fausses données envoyées)
+    pub poisoned_requests: AtomicU64,
+    
     /// Requêtes bloquées par domaine
     blocked_by_domain: RwLock<HashMap<String, u64>>,
     
     /// Requêtes bloquées par type
     blocked_by_type: RwLock<HashMap<String, u64>>,
+    
+    /// Requêtes empoisonnées par type
+    poisoned_by_type: RwLock<HashMap<String, u64>>,
 }
 
 impl AdBlockStats {
@@ -29,8 +35,10 @@ impl AdBlockStats {
         Self {
             blocked_requests: AtomicU64::new(0),
             allowed_requests: AtomicU64::new(0),
+            poisoned_requests: AtomicU64::new(0),
             blocked_by_domain: RwLock::new(HashMap::new()),
             blocked_by_type: RwLock::new(HashMap::new()),
+            poisoned_by_type: RwLock::new(HashMap::new()),
         }
     }
     
@@ -42,6 +50,15 @@ impl AdBlockStats {
     /// Incrémente le compteur de requêtes autorisées
     pub fn increment_allowed(&self) {
         self.allowed_requests.fetch_add(1, Ordering::Relaxed);
+    }
+    
+    /// Incrémente le compteur de requêtes empoisonnées
+    pub fn increment_poisoned(&self, request_type: &str) {
+        self.poisoned_requests.fetch_add(1, Ordering::Relaxed);
+        
+        // Enregistrer par type
+        let mut types = self.poisoned_by_type.write().unwrap();
+        *types.entry(request_type.to_string()).or_insert(0) += 1;
     }
     
     /// Enregistre une requête bloquée avec contexte
@@ -69,9 +86,10 @@ impl AdBlockStats {
     }
     
     /// Retourne les statistiques globales
-    pub fn get_totals(&self) -> (u64, u64) {
+    pub fn get_totals(&self) -> (u64, u64, u64) {
         (
             self.blocked_requests.load(Ordering::Relaxed),
+            self.poisoned_requests.load(Ordering::Relaxed),
             self.allowed_requests.load(Ordering::Relaxed),
         )
     }
@@ -81,20 +99,26 @@ impl AdBlockStats {
         self.blocked_requests.load(Ordering::Relaxed)
     }
     
+    /// Retourne le nombre de requêtes empoisonnées
+    pub fn get_poisoned_count(&self) -> u64 {
+        self.poisoned_requests.load(Ordering::Relaxed)
+    }
+    
     /// Retourne le nombre de requêtes autorisées
     pub fn get_allowed_count(&self) -> u64 {
         self.allowed_requests.load(Ordering::Relaxed)
     }
     
-    /// Retourne le pourcentage de requêtes bloquées
+    /// Retourne le pourcentage de requêtes bloquées ou empoisonnées
     pub fn get_block_percentage(&self) -> f64 {
         let blocked = self.get_blocked_count() as f64;
-        let total = (self.get_blocked_count() + self.get_allowed_count()) as f64;
+        let poisoned = self.get_poisoned_count() as f64;
+        let total = (self.get_blocked_count() + self.get_poisoned_count() + self.get_allowed_count()) as f64;
         
         if total == 0.0 {
             0.0
         } else {
-            (blocked / total) * 100.0
+            ((blocked + poisoned) / total) * 100.0
         }
     }
     
@@ -120,27 +144,36 @@ impl AdBlockStats {
         self.blocked_by_type.read().unwrap().clone()
     }
     
+    /// Retourne les types de ressources empoisonnées
+    pub fn get_poisoned_by_type(&self) -> HashMap<String, u64> {
+        self.poisoned_by_type.read().unwrap().clone()
+    }
+    
     /// Réinitialise toutes les statistiques
     pub fn reset(&self) {
         self.blocked_requests.store(0, Ordering::Relaxed);
+        self.poisoned_requests.store(0, Ordering::Relaxed);
         self.allowed_requests.store(0, Ordering::Relaxed);
         
         self.blocked_by_domain.write().unwrap().clear();
         self.blocked_by_type.write().unwrap().clear();
+        self.poisoned_by_type.write().unwrap().clear();
     }
     
     /// Génère un rapport textuel des statistiques
     pub fn generate_report(&self) -> String {
-        let (blocked, allowed) = self.get_totals();
+        let (blocked, poisoned, allowed) = self.get_totals();
         let percentage = self.get_block_percentage();
         let top_domains = self.get_top_blocked_domains(10);
-        let types = self.get_blocked_by_type();
+        let blocked_types = self.get_blocked_by_type();
+        let poisoned_types = self.get_poisoned_by_type();
         
         let mut report = String::new();
-        report.push_str("=== Statistiques AdBlock ===\n\n");
+        report.push_str("=== Statistiques AdBlock / Tracker Poisoning ===\n\n");
         report.push_str(&format!("Requêtes bloquées: {}\n", blocked));
+        report.push_str(&format!("Requêtes empoisonnées (fausses données): {}\n", poisoned));
         report.push_str(&format!("Requêtes autorisées: {}\n", allowed));
-        report.push_str(&format!("Pourcentage bloqué: {:.2}%\n\n", percentage));
+        report.push_str(&format!("Pourcentage protégé (bloqué + empoisonné): {:.2}%\n\n", percentage));
         
         if !top_domains.is_empty() {
             report.push_str("Top 10 des domaines bloqués:\n");
@@ -150,13 +183,24 @@ impl AdBlockStats {
             report.push_str("\n");
         }
         
-        if !types.is_empty() {
+        if !blocked_types.is_empty() {
             report.push_str("Blocages par type de ressource:\n");
-            let mut sorted_types: Vec<_> = types.iter().collect();
+            let mut sorted_types: Vec<_> = blocked_types.iter().collect();
             sorted_types.sort_by(|a, b| b.1.cmp(a.1));
             
             for (type_name, count) in sorted_types {
                 report.push_str(&format!("  {}: {}\n", type_name, count));
+            }
+            report.push_str("\n");
+        }
+        
+        if !poisoned_types.is_empty() {
+            report.push_str("Empoisonnement par type de ressource:\n");
+            let mut sorted_types: Vec<_> = poisoned_types.iter().collect();
+            sorted_types.sort_by(|a, b| b.1.cmp(a.1));
+            
+            for (type_name, count) in sorted_types {
+                report.push_str(&format!("  {}: {} (fausses données envoyées)\n", type_name, count));
             }
         }
         

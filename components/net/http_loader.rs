@@ -97,7 +97,7 @@ use crate::websocket_loader::start_websocket;
 use crate::adblock_engine::AdBlockEngine;
 use crate::adblock_config::AdBlockConfig;
 use crate::adblock_stats::AdBlockStats;
-
+use crate::tracker_poisoning::{TrackerPoisoner, TrackerPoisoningConfig};
 
 /// The various states an entry of the HttpCache can be in.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -122,6 +122,7 @@ pub struct HttpState {
 
     pub adblock_engine: StdArc<AdBlockEngine>,
     pub adblock_stats: StdArc<AdBlockStats>,
+    pub tracker_poisoner: StdArc<parking_lot::Mutex<TrackerPoisoner>>,
 }
 
 impl HttpState {
@@ -222,6 +223,45 @@ impl HttpState {
         }
         
         should_block
+    }
+
+    pub fn init_tracker_poisoner() -> StdArc<parking_lot::Mutex<TrackerPoisoner>> {
+        use std::path::Path;
+        
+        let config_path = Path::new("resources/adblock/poisoning_config.json").to_path_buf();
+        
+        let config = match std::fs::read_to_string(&config_path) {
+            Ok(content) => {
+                match serde_json::from_str::<TrackerPoisoningConfig>(&content) {
+                    Ok(cfg) => {
+                        info!("TrackerPoisoning: Configuration chargée depuis {:?}", config_path);
+                        cfg
+                    }
+                    Err(e) => {
+                        warn!("TrackerPoisoning: Erreur parsing: {}, valeurs par défaut", e);
+                        TrackerPoisoningConfig::default()
+                    }
+                }
+            }
+            Err(_) => {
+                info!("TrackerPoisoning: Utilisation configuration par défaut");
+                let default_config = TrackerPoisoningConfig::default();
+                
+                if let Some(parent) = config_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if let Ok(json) = serde_json::to_string_pretty(&default_config) {
+                    let _ = std::fs::write(&config_path, json);
+                }
+                
+                default_config
+            }
+        };
+        
+        info!("TrackerPoisoning: Mode {} activé", 
+              if config.enabled { "empoisonnement" } else { "blocage classique" });
+        
+        StdArc::new(parking_lot::Mutex::new(TrackerPoisoner::new(config)))
     }
 }
 
@@ -2196,6 +2236,10 @@ async fn http_network_fetch(
             (Decoder::detect(response, url.is_secure_scheme()), None)
         },
         _ => {
+            if context.state.tracker_poisoner.lock().generator.config.enabled {
+                context.state.tracker_poisoner.lock().poison_request_headers(&mut request.headers);
+            }
+
             let response_future = obtain_response(
                 &context.state.client,
                 &url,

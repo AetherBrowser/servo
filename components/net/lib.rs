@@ -45,3 +45,4 @@ pub mod test {
 pub mod adblock_engine;
 pub mod adblock_config;
 pub mod adblock_stats;
+pub mod tracker_poisoning;
