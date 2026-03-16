@@ -1378,6 +1378,9 @@ impl FetchResponseListener for ParserContext {
                     // The next load will show a page
                     return;
                 },
+                NetworkError::AdBlockBlocked => {
+                    "Blocked by adblock".to_string()
+                },
             };
             self.load_inline_unknown_content(&parser, page, cx);
         }

@@ -39,3 +39,10 @@ pub mod test {
     pub use crate::hosts::parse_hostsfile;
     pub use crate::http_loader::HttpState;
 }
+
+/// Ad block
+
+pub mod adblock_engine;
+pub mod adblock_config;
+pub mod adblock_stats;
+pub mod tracker_poisoning;
