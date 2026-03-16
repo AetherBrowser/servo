@@ -91,8 +91,10 @@ unsafe extern "C" fn stream_open_cb(
 
 unsafe extern "C" fn stream_read_cb(cookie: *mut c_void, buf: *mut c_char, nbytes: u64) -> i64 {
     let reader = unsafe { &mut *(cookie as *mut StreamReader) };
+    if reader.cancelled.load(Ordering::Relaxed) {
+        return -1;
+    }
     let want   = nbytes as usize;
-
 
     fill_to(reader, reader.read_pos + want);
 
@@ -116,13 +118,15 @@ unsafe extern "C" fn stream_read_cb(cookie: *mut c_void, buf: *mut c_char, nbyte
 
 unsafe extern "C" fn stream_seek_cb(cookie: *mut c_void, offset: i64) -> i64 {
     let reader = unsafe { &mut *(cookie as *mut StreamReader) };
+    if reader.cancelled.load(Ordering::Relaxed) {
+        return -1;
+    }
     let target = offset as usize;
-
 
     fill_to(reader, target);
 
     if reader.cancelled.load(Ordering::Relaxed) {
-        return -20;
+        return -1;
     }
 
     reader.read_pos = target.min(reader.all_data.len());
@@ -156,6 +160,7 @@ struct SharedState {
     muted:       AtomicBool,
     volume_bits: AtomicU64,
     rate_bits:   AtomicU64,
+    seek_bits:   AtomicU64,  // target seek position in seconds (f64 bits), NaN = no seek pending
     stop:        AtomicBool,
     #[allow(dead_code)]
     id:          usize,
@@ -175,6 +180,8 @@ pub struct MpvPlayer {
 
 static PLAYER_ID: AtomicI32 = AtomicI32::new(1);
 
+
+
 impl MpvPlayer {
     pub fn new(
         _context_id:    &ClientContextId,
@@ -183,15 +190,17 @@ impl MpvPlayer {
         video_renderer: Option<Arc<Mutex<dyn VideoFrameRenderer>>>,
     ) -> Self {
         let id = PLAYER_ID.fetch_add(1, Ordering::Relaxed) as usize;
+        servo_media_traits::register_player(id as i32);
 
         let (stream_tx, stream_rx) = mpsc::channel::<Vec<u8>>();
         let cancelled = Arc::new(AtomicBool::new(false));
 
         let state = Arc::new(SharedState {
-            playing:     AtomicBool::new(false),
+            playing:     AtomicBool::new(true), // MPV starts with pause="no"
             muted:       AtomicBool::new(false),
             volume_bits: AtomicU64::new(f64::to_bits(1.0)),
             rate_bits:   AtomicU64::new(f64::to_bits(1.0)),
+            seek_bits:   AtomicU64::new(f64::to_bits(f64::NAN)),
             stop:        AtomicBool::new(false),
             id,
             stream_tx:   Mutex::new(Some(stream_tx)),
@@ -219,22 +228,31 @@ impl Drop for MpvPlayer {
 
 impl Player for MpvPlayer {
     fn play(&self) -> Result<(), PlayerError> {
+        eprintln!("[MPV-API] player-{} play()", self.id);
         self.state.playing.store(true, Ordering::Relaxed);
+        let prev = servo_media_traits::audio_focus_player();
+        servo_media_traits::set_audio_focus(self.id as i32);
         Ok(())
     }
     fn pause(&self) -> Result<(), PlayerError> {
+        eprintln!("[MPV-API] player-{} pause()", self.id);
         self.state.playing.store(false, Ordering::Relaxed);
         Ok(())
     }
     fn paused(&self) -> bool { !self.state.playing.load(Ordering::Relaxed) }
     fn can_resume(&self) -> bool { true }
     fn stop(&self) -> Result<(), PlayerError> {
+        eprintln!("[MPV-API] player-{} stop()", self.id);
         self.state.stop.store(true, Ordering::SeqCst);
         self.state.cancelled.store(true, Ordering::SeqCst);
         Ok(())
     }
-    fn seek(&self, _: f64) -> Result<(), PlayerError> { Err(PlayerError::NonSeekableStream) }
-    fn seekable(&self) -> Vec<Range<f64>> { vec![] }
+    fn seek(&self, time: f64) -> Result<(), PlayerError> {
+        eprintln!("[MPV-API] player-{} seek({})", self.id, time);
+        self.state.seek_bits.store(f64::to_bits(time), Ordering::SeqCst);
+        Ok(())
+    }
+    fn seekable(&self) -> Vec<Range<f64>> { vec![0.0..f64::MAX] }
     fn set_mute(&self, m: bool) -> Result<(), PlayerError> {
         self.state.muted.store(m, Ordering::Relaxed);
         Ok(())
@@ -327,9 +345,17 @@ fn run_player(
     set_prop!("input-default-bindings", false);
     set_prop!("input-vo-keyboard", false);
     set_prop!("osc", false);
-    set_prop!("demuxer-max-bytes", "50MiB");
-    set_prop!("demuxer-readahead-secs", 30i64);
+    set_prop!("demuxer-max-bytes", "4MiB");
+    set_prop!("demuxer-readahead-secs", 5i64);
+    set_prop!("cache", "yes");
+    set_prop!("cache-secs", 5i64);
+    set_prop!("keep-open", "yes");
     set_prop!("pause", "no");
+    // Only player 1 gets audio.
+    let init_volume = if player_id == 1 { 100i64 } else { 0i64 };
+    eprintln!("[MPV-DBG] player-{} init volume={}", player_id, init_volume);
+    set_prop!("volume", init_volume);
+    set_prop!("vd", "openh264,h264,h264_vaapi");
 
     let ctx = mpv.handle;
 
@@ -389,12 +415,13 @@ fn run_player(
 
     let mut video_width:  i32   = 0;
     let mut video_height: i32   = 0;
-    let mut last_playing        = false;
-    let mut last_muted          = false;
-    let mut last_volume         = 100.0f64;
+    let mut last_playing        = true; // synced: MPV starts with pause="no"
+    let mut last_volume         = 0.0f64;
     let mut last_rate           = 1.0f64;
     let mut last_duration       = -1.0f64;
     let mut metadata_sent       = false;
+    let mut eof_sent            = false;
+    let mut pending_seek_pos: f64 = f64::NAN; // track requested seek position for SeekDone
 
     println!("🎬 MPV player loop running for player-{}", player_id);
     loop {
@@ -402,22 +429,30 @@ fn run_player(
 
         let playing = state.playing.load(Ordering::Relaxed);
         if playing != last_playing {
-            let _ = mpv.set_property("pause", !playing);
+            let pause_val = if playing { "no" } else { "yes" };
+            eprintln!("[MPV-LOOP] player-{} pause={} (playing={})", player_id, pause_val, playing);
+            let _ = mpv.set_property("pause", pause_val);
             last_playing = playing;
             let ps = if playing { PlaybackState::Playing } else { PlaybackState::Paused };
             let _ = sender.send(PlayerEvent::StateChanged(ps));
         }
 
-        let muted = state.muted.load(Ordering::Relaxed);
-        if muted != last_muted {
-            let _ = mpv.set_property("mute", muted);
-            last_muted = muted;
+        // Audio focus: only the focused player has volume.
+        let focus_id = servo_media_traits::audio_focus_player();
+        let has_focus = focus_id == player_id as i32;
+        let target_vol: i64 = if has_focus { 100 } else { 0 };
+        if target_vol != last_volume as i64 {
+            let _ = mpv.set_property("volume", target_vol);
+            last_volume = target_vol as f64;
         }
 
-        let volume = state.volume() * 100.0;
-        if (volume - last_volume).abs() > 0.1 {
-            let _ = mpv.set_property("volume", volume);
-            last_volume = volume;
+        // Handle pending seek.
+        let seek_pos = f64::from_bits(state.seek_bits.load(Ordering::SeqCst));
+        if !seek_pos.is_nan() {
+            state.seek_bits.store(f64::to_bits(f64::NAN), Ordering::SeqCst);
+            eprintln!("[MPV-LOOP] player-{} seeking to {}s", player_id, seek_pos);
+            pending_seek_pos = seek_pos;
+            let _ = mpv.set_property("time-pos", seek_pos);
         }
 
         let rate = state.rate();
@@ -451,16 +486,25 @@ fn run_player(
                     if reason < 0 {
                         log::error!("mpv: end file with error: {}", reason);
                         let _ = sender.send(PlayerEvent::Error("playback error".to_string()));
+                        break;
                     } else if reason == 3 {
-                        eprintln!("[MPV-DBG] EndFile: mpv error (reason=3), trying to get error detail");
-                        if let Some(err) = mpv.get_property_string("sub-text") {
-                        }
+                        eprintln!("[MPV-DBG] EndFile: mpv error (reason=3)");
                         let _ = sender.send(PlayerEvent::Error("playback error (end_file reason=3)".to_string()));
+                        break;
                     } else {
+                        // EOF: send final duration and position so DOM knows playback ended.
+                        if let Ok(dur) = mpv.get_property::<f64>("duration") {
+                            if dur > 0.0 {
+                                let _ = sender.send(PlayerEvent::DurationChanged(Some(
+                                    std::time::Duration::from_secs_f64(dur),
+                                )));
+                                let _ = sender.send(PlayerEvent::PositionChanged(dur));
+                            }
+                        }
+                        // EOF: don't break — keep the loop alive so seek/replay works.
                         let _ = sender.send(PlayerEvent::EndOfStream);
+                        let _ = sender.send(PlayerEvent::StateChanged(PlaybackState::Stopped));
                     }
-                    let _ = sender.send(PlayerEvent::StateChanged(PlaybackState::Stopped));
-                    break;
                 },
                 MpvEvent::VideoReconfig => {
                     eprintln!("[MPV-DBG] MPV_EVENT_VIDEO_RECONFIG");
@@ -487,7 +531,15 @@ fn run_player(
                     let _ = sender.send(PlayerEvent::StateChanged(PlaybackState::Buffering));
                 },
                 MpvEvent::PlaybackRestart => {
-                    eprintln!("[MPV-DBG] MPV_EVENT_PLAYBACK_RESTART");
+                    eprintln!("[MPV-DBG] MPV_EVENT_PLAYBACK_RESTART for player-{}", player_id);
+                    // PlaybackRestart fires after a seek completes — send SeekDone so the DOM
+                    // clears its `seeking` flag and resumes normal playback processing.
+                    if !pending_seek_pos.is_nan() {
+                        let done_pos = pending_seek_pos;
+                        pending_seek_pos = f64::NAN;
+                        eprintln!("[MPV-DBG]   sending SeekDone({})", done_pos);
+                        let _ = sender.send(PlayerEvent::SeekDone(done_pos));
+                    }
                     let _ = sender.send(PlayerEvent::StateChanged(PlaybackState::Playing));
                 },
                 MpvEvent::Idle => {
@@ -509,7 +561,7 @@ fn run_player(
                 width:        video_width as u32,
                 height:       video_height as u32,
                 format:       String::from("bgra"),
-                is_seekable:  false,
+                is_seekable:  true,
                 video_tracks: vec![String::from("video")],
                 audio_tracks: vec![String::from("audio")],
                 is_live:      false,
@@ -540,12 +592,11 @@ fn run_player(
 
                 let render_rc = unsafe { mpv_render_context_render(render_ctx, rp.as_ptr()) };
                 if render_rc == 0 {
-                    let non_zero = pixels.iter().any(|&b| b != 0);
-
                     let buf = Arc::new(PixelBuffer(Arc::new(pixels)));
                     match VideoFrame::new(video_width, video_height, buf) {
                         Some(frame) => {
                             if let Ok(mut r) = renderer.lock() {
+                                eprintln!("[MPV-RENDER] player-{} rendering frame", player_id);
                                 r.render(frame);
                             } else {
                                 eprintln!("[MPV-DBG] WARNING: could not lock renderer");
@@ -581,11 +632,35 @@ fn run_player(
             }
         }
 
+        // Detect end-of-file with keep-open=yes (MPV pauses at last frame instead of EndFile).
+        if let Ok(eof) = mpv.get_property::<bool>("eof-reached") {
+            if eof && !eof_sent {
+                eof_sent = true;
+                eprintln!("[MPV-LOOP] player-{} eof-reached=true, sending EndOfStream", player_id);
+                // Send final duration and position so DOM knows playback ended.
+                if last_duration > 0.0 {
+                    let _ = sender.send(PlayerEvent::PositionChanged(last_duration));
+                }
+                let _ = sender.send(PlayerEvent::EndOfStream);
+                let _ = sender.send(PlayerEvent::StateChanged(PlaybackState::Stopped));
+            } else if !eof && eof_sent {
+                // Reset when seeking back from EOF.
+                eof_sent = false;
+                eprintln!("[MPV-LOOP] player-{} eof-reached=false, reset eof_sent", player_id);
+            }
+        }
+
         thread::sleep(Duration::from_millis(16));
     }
 
-    drop(reader);
+    state.stop.store(true, Ordering::SeqCst);
+
+    // IMPORTANT: destroy MPV first so it stops calling stream callbacks,
+    // then drop the reader. Reverse order = use-after-free.
     unsafe {
         mpv_render_context_free(render_ctx);
     }
+    // mpv handle is dropped here when `mpv` goes out of scope.
+    drop(mpv);
+    drop(reader);
 }
