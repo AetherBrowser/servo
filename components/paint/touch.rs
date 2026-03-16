@@ -107,6 +107,9 @@ pub struct TouchSequenceInfo {
     /// Once the first move has been processed by script, we can transition to
     /// non-cancellable events, and directly perform the pan without waiting for script.
     pub prevent_move: TouchMoveAllowed,
+    /// Accumulated finger displacement since the beginning of this touch sequence.
+    /// Used to detect predominantly vertical swipes for snap scrolling.
+    accumulated_delta: Vector2D<f32, DevicePixel>,
     /// Move operation waiting to be processed in the touch sequence.
     ///
     /// This is only used while the first touch move is processed in script.
@@ -217,6 +220,7 @@ impl TouchHandler {
             touch_ids_in_move: FxHashSet::default(),
             prevent_click: false,
             prevent_move: TouchMoveAllowed::Pending,
+            accumulated_delta: Vector2D::zero(),
             pending_touch_move_actions: vec![],
             hit_test_result_cache: None,
         };
@@ -362,6 +366,7 @@ impl TouchHandler {
                     touch_ids_in_move: FxHashSet::default(),
                     prevent_click: false,
                     prevent_move: TouchMoveAllowed::Pending,
+                    accumulated_delta: Vector2D::zero(),
                     pending_touch_move_actions: vec![],
                     hit_test_result_cache: None,
                 },
@@ -388,32 +393,34 @@ impl TouchHandler {
     pub(crate) fn notify_new_frame_start(&mut self) -> Option<FlingAction> {
         let touch_sequence = self.touch_sequence_map.get_mut(&self.current_sequence_id)?;
 
-        let Flinging {
-            velocity,
-            point: cursor,
-        } = &mut touch_sequence.state
-        else {
-            self.observing_frames_for_fling.set(false);
-            return None;
-        };
-
-        if velocity.length().abs() < FLING_MIN_SCREEN_PX {
-            self.stop_fling_if_needed();
-            None
-        } else {
-            // TODO: Probably we should multiply with the current refresh rate (and divide on each frame)
-            // or save a timestamp to account for a potentially changing display refresh rate.
-            *velocity *= FLING_SCALING_FACTOR;
-            let _span = profile_traits::info_span!(
-                "TouchHandler::Flinging",
-                velocity = ?velocity,
-            )
-            .entered();
-            debug_assert!(velocity.length() <= FLING_MAX_SCREEN_PX);
-            Some(FlingAction {
-                delta: DeviceVector2D::new(velocity.x, velocity.y),
-                cursor: *cursor,
-            })
+        match &mut touch_sequence.state {
+            Flinging {
+                velocity,
+                point: cursor,
+            } => {
+                if velocity.length().abs() < FLING_MIN_SCREEN_PX {
+                    self.stop_fling_if_needed();
+                    None
+                } else {
+                    // TODO: Probably we should multiply with the current refresh rate (and divide on each frame)
+                    // or save a timestamp to account for a potentially changing display refresh rate.
+                    *velocity *= FLING_SCALING_FACTOR;
+                    let _span = profile_traits::info_span!(
+                        "TouchHandler::Flinging",
+                        velocity = ?velocity,
+                    )
+                    .entered();
+                    debug_assert!(velocity.length() <= FLING_MAX_SCREEN_PX);
+                    Some(FlingAction {
+                        delta: DeviceVector2D::new(velocity.x, velocity.y),
+                        cursor: *cursor,
+                    })
+                }
+            },
+            _ => {
+                self.observing_frames_for_fling.set(false);
+                None
+            },
         }
     }
 
@@ -425,9 +432,9 @@ impl TouchHandler {
             );
             return;
         };
-        let Flinging { .. } = touch_sequence.state else {
+        if !matches!(touch_sequence.state, Flinging { .. }) {
             return;
-        };
+        }
         let _span = profile_traits::info_span!("TouchHandler::FlingEnd").entered();
         debug!("Stopping flinging in touch sequence {current_sequence_id:?}");
         touch_sequence.state = Finished;
@@ -468,6 +475,8 @@ impl TouchHandler {
                     // TODO: Probably we should track 1-3 more points and use a smarter algorithm
                     *velocity += delta;
                     *velocity /= 2.0;
+                    // Accumulate total finger displacement for snap detection.
+                    touch_sequence.accumulated_delta += delta;
                     // update the touch point every time when panning.
                     touch_sequence.active_touch_points[idx].point = point;
 
@@ -490,6 +499,8 @@ impl TouchHandler {
                     };
                     // No clicks should be issued after we transitioned to move.
                     touch_sequence.prevent_click = true;
+                    // Also accumulate this initial panning delta for snap detection.
+                    touch_sequence.accumulated_delta += delta;
                     // update the touch point
                     touch_sequence.active_touch_points[idx].point = point;
 
@@ -541,7 +552,11 @@ impl TouchHandler {
         action
     }
 
-    pub(crate) fn on_touch_up(&mut self, touch_id: TouchId, point: Point2D<f32, DevicePixel>) {
+    pub(crate) fn on_touch_up(
+        &mut self,
+        touch_id: TouchId,
+        point: Point2D<f32, DevicePixel>,
+    ) {
         let Some(touch_sequence) = self.try_get_current_touch_sequence_mut() else {
             warn!("Current touch sequence not found");
             return;
@@ -606,7 +621,8 @@ impl TouchHandler {
                     touch_sequence.state = Finished;
                 }
             },
-            PendingFling { .. } | Flinging { .. } | PendingClick(_) | Finished => {
+            PendingFling { .. } | Flinging { .. } | PendingClick(_) |
+            Finished => {
                 error!("Touch-up received, but touch handler already in post-touchup state.")
             },
         }

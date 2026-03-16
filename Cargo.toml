@@ -180,6 +180,7 @@ serde_json = "1.0"
 servo-media = { path = "components/media/servo-media" }
 servo-media-dummy = { path = "components/media/backends/dummy" }
 servo-media-gstreamer = { path = "components/media/backends/gstreamer" }
+servo-media-mpv = { path = "components/media/backends/mpv" }
 servo-tracing = { path = "components/servo_tracing" }
 servo_arc = { git = "https://github.com/servo/stylo", rev = "9b635629e627a611419745198de1b1ba6c8667c2" }
 sha1 = "0.10"

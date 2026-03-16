@@ -39,7 +39,7 @@ OriginalFilename = "servo.exe"
 ProductName = "Servo"
 
 [features]
-default = ["gamepad", "libservo/clipboard", "js_jit", "max_log_level", "webgpu", "webxr"]
+default = ["gamepad", "libservo/clipboard", "js_jit", "max_log_level", "media-mpv", "webgpu", "webxr"]
 crown = ["libservo/crown"]
 debugmozjs = ["libservo/debugmozjs"]
 gamepad = ["libservo/gamepad"]
@@ -48,6 +48,7 @@ js_backtrace = ["libservo/js_backtrace"]
 js_jit = ["libservo/js_jit"]
 max_log_level = ["log/release_max_level_info"]
 media-gstreamer = ["libservo/media-gstreamer"]
+media-mpv = ["libservo/media-mpv"]
 native-bluetooth = ["libservo/native-bluetooth"]
 profilemozjs = ["libservo/profilemozjs"]
 refcell_backtrace = ["libservo/refcell_backtrace"]

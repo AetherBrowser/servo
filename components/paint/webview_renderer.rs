@@ -501,7 +501,8 @@ impl WebViewRenderer {
         let point = event
             .point
             .as_device_point(self.device_pixels_per_page_pixel());
-        self.touch_handler.on_touch_up(event.touch_id, point);
+        self.touch_handler
+            .on_touch_up(event.touch_id, point);
         self.send_touch_event(render_api, event, id);
     }
 
@@ -1085,9 +1086,12 @@ impl WebViewRenderer {
         if let Some(wheel_event) = self.pending_wheel_events.remove(&id) {
             if !result.contains(InputEventResult::DefaultPrevented) {
                 // A scroll delta for a wheel event is the inverse of the wheel delta.
-                let scroll_delta =
-                    DeviceVector2D::new(-wheel_event.delta.x as f32, -wheel_event.delta.y as f32);
-                self.notify_scroll_event(Scroll::Delta(scroll_delta.into()), wheel_event.point);
+                let delta_x = -wheel_event.delta.x as f32;
+                let delta_y = -wheel_event.delta.y as f32;
+                self.notify_scroll_event(
+                    Scroll::Delta(DeviceVector2D::new(delta_x, delta_y).into()),
+                    wheel_event.point,
+                );
             }
         }
     }

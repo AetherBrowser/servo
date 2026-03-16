@@ -88,7 +88,22 @@ use crate::webview_delegate::{
     PermissionRequest, ProtocolHandlerRegistration, WebResourceLoad,
 };
 
-#[cfg(feature = "media-gstreamer")]
+#[cfg(all(feature = "media-mpv", feature = "media-gstreamer"))]
+compile_error!("Features 'media-mpv' and 'media-gstreamer' are mutually exclusive.");
+
+#[cfg(feature = "media-mpv")]
+mod media_platform {
+    use servo_media_mpv::MpvBackend;
+
+    use super::ServoMedia;
+
+    pub fn init() {
+        eprintln!("[MEDIA-BACKEND] Initializing MPV backend");
+        ServoMedia::init::<MpvBackend>();
+    }
+}
+
+#[cfg(all(feature = "media-gstreamer", not(feature = "media-mpv")))]
 mod media_platform {
     #[cfg(any(windows, target_os = "macos"))]
     mod gstreamer_plugins {
@@ -124,14 +139,16 @@ mod media_platform {
 
     #[cfg(not(any(windows, target_os = "macos")))]
     pub fn init() {
+        eprintln!("[MEDIA-BACKEND] Initializing GStreamer backend (linux)");
         ServoMedia::init::<GStreamerBackend>();
     }
 }
 
-#[cfg(not(feature = "media-gstreamer"))]
+#[cfg(not(any(feature = "media-gstreamer", feature = "media-mpv")))]
 mod media_platform {
     use super::ServoMedia;
     pub fn init() {
+        eprintln!("[MEDIA-BACKEND] Initializing Dummy backend (no media support)");
         ServoMedia::init::<servo_media_dummy::DummyBackend>();
     }
 }

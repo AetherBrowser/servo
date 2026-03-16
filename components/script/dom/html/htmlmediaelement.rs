@@ -707,9 +707,14 @@ impl HTMLMediaElement {
             .as_ref()
             .is_some_and(|player| !player.lock().unwrap().paused());
 
-        if self.is_potentially_playing() && !is_playing {
+        let potentially = self.is_potentially_playing();
+        eprintln!("[MEDIA-DBG] update_media_state: potentially_playing={}, is_playing={}, paused={}",
+            potentially, is_playing, self.Paused());
+
+        if potentially && !is_playing {
             if let Some(ref player) = *self.player.borrow() {
                 let player = player.lock().unwrap();
+                eprintln!("[MEDIA-DBG] -> calling player.play()");
 
                 if let Err(error) = player.set_playback_rate(self.playback_rate.get()) {
                     warn!("Could not set the playback rate: {error:?}");
@@ -721,12 +726,15 @@ impl HTMLMediaElement {
                     error!("Could not play media: {error:?}");
                 }
             }
-        } else if is_playing {
+        } else if !potentially && is_playing {
             if let Some(ref player) = *self.player.borrow() {
+                eprintln!("[MEDIA-DBG] -> calling player.pause()");
                 if let Err(error) = player.lock().unwrap().pause() {
                     error!("Could not pause player: {error:?}");
                 }
             }
+        } else {
+            eprintln!("[MEDIA-DBG] -> no action taken (potentially={}, is_playing={})", potentially, is_playing);
         }
     }
 
@@ -742,6 +750,34 @@ impl HTMLMediaElement {
             *blocker.borrow_mut() = Some(LoadBlocker::new(&self.owner_document(), LoadType::Media));
         } else if !delay && blocker.borrow().is_some() {
             LoadBlocker::terminate(blocker, cx);
+        }
+    }
+
+    /// Pause all other media elements in the same document that are currently playing.
+    /// This prevents multiple videos from playing simultaneously, which is important for
+    /// platforms like TikTok where only one video should play at a time when scrolling.
+    fn pause_other_media_elements(&self) {
+        use crate::dom::node::ShadowIncluding;
+
+        let document = self.owner_document();
+
+        // Get all media elements in the document (both video and audio)
+        let media_elements = document
+            .upcast::<Node>()
+            .traverse_preorder(ShadowIncluding::No)
+            .filter_map(DomRoot::downcast::<HTMLMediaElement>);
+
+        // Pause all other media elements that are currently playing
+        for media_element in media_elements {
+            // Skip the current element
+            if &*media_element == self {
+                continue;
+            }
+
+            // If the element is playing, pause it
+            if !media_element.Paused() {
+                media_element.internal_pause_steps();
+            }
         }
     }
 
@@ -761,20 +797,23 @@ impl HTMLMediaElement {
 
     /// <https://html.spec.whatwg.org/multipage/#internal-play-steps>
     fn internal_play_steps(&self, cx: &mut js::context::JSContext) {
+        let ended = self.ended_playback(LoopCondition::Ignored);
+        eprintln!("[DOM-DBG] internal_play_steps: ended={}, paused={}, ready_state={:?}",
+            ended, self.Paused(), self.ready_state.get() as u16);
+
         // Step 1. If the media element's networkState attribute has the value NETWORK_EMPTY, invoke
         // the media element's resource selection algorithm.
         if self.network_state.get() == NetworkState::Empty {
+            eprintln!("[DOM-DBG]   networkState=EMPTY, invoking resource selection");
             self.invoke_resource_selection_algorithm(cx);
         }
 
         // Step 2. If the playback has ended and the direction of playback is forwards, seek to the
         // earliest possible position of the media resource.
-        // Generally "ended" and "looping" are exclusive. Here, the loop attribute is ignored to
-        // seek back to start in case loop was set after playback ended.
-        // <https://github.com/whatwg/html/issues/4487>
-        if self.ended_playback(LoopCondition::Ignored) &&
+        if ended &&
             self.direction_of_playback() == PlaybackDirection::Forwards
         {
+            eprintln!("[DOM-DBG]   seeking to earliest position (restart)");
             self.seek(
                 self.earliest_possible_position(),
                 /* approximate_for_speed */ false,
@@ -785,6 +824,10 @@ impl HTMLMediaElement {
 
         // Step 3. If the media element's paused attribute is true, then:
         if self.Paused() {
+            // Before starting playback, pause all other playing media elements in the same document.
+            // This prevents multiple videos from playing simultaneously (e.g., when scrolling on TikTok).
+            self.pause_other_media_elements();
+
             // Step 3.1. Change the value of paused to false.
             self.paused.set(false);
 
@@ -2247,10 +2290,12 @@ impl HTMLMediaElement {
 
         // The element's readyState attribute is HAVE_METADATA or greater, and
         if self.ready_state.get() < ReadyState::HaveMetadata {
+            eprintln!("[DOM-DBG] ended_playback: false (ready_state < HaveMetadata, got {:?})", self.ready_state.get() as u16);
             return false;
         }
 
         let playback_position = self.current_playback_position.get();
+        eprintln!("[DOM-DBG] ended_playback: pos={}, duration={}, ready_state={}", playback_position, self.Duration(), self.ready_state.get() as u16);
 
         match self.direction_of_playback() {
             // Either: The current playback position is the end of the media resource, and the
@@ -2337,13 +2382,26 @@ impl HTMLMediaElement {
     }
 
     fn playback_end(&self) {
+        eprintln!("[DOM-DBG] playback_end() called, seeking={}, pos={}, duration={}",
+            self.seeking.get(), self.current_playback_position.get(), self.duration.get());
         // Abort the following steps of the end of playback if seeking is in progress.
         if self.seeking.get() {
+            eprintln!("[DOM-DBG]   playback_end: aborting because seeking is in progress");
             return;
         }
 
+        // Ensure the playback position equals the duration so that ended_playback() returns true.
+        // The media backend may not have sent a final PositionChanged matching the exact duration.
+        let duration = self.duration.get();
+        if duration.is_finite() && duration > 0.0 {
+            self.current_playback_position.set(duration);
+        }
+
         match self.direction_of_playback() {
-            PlaybackDirection::Forwards => self.end_of_playback_in_forwards_direction(),
+            PlaybackDirection::Forwards => {
+                eprintln!("[DOM-DBG]   playback_end: calling end_of_playback_in_forwards_direction");
+                self.end_of_playback_in_forwards_direction();
+            },
             PlaybackDirection::Backwards => self.end_of_playback_in_backwards_direction(),
         }
     }
@@ -2759,13 +2817,13 @@ impl HTMLMediaElement {
         match *state {
             PlaybackState::Paused => {
                 media_session_playback_state = MediaSessionPlaybackState::Paused;
-                if self.ready_state.get() == ReadyState::HaveMetadata {
+                if self.ready_state.get() <= ReadyState::HaveCurrentData {
                     self.change_ready_state(ReadyState::HaveEnoughData);
                 }
             },
             PlaybackState::Playing => {
                 media_session_playback_state = MediaSessionPlaybackState::Playing;
-                if self.ready_state.get() == ReadyState::HaveMetadata {
+                if self.ready_state.get() <= ReadyState::HaveCurrentData {
                     self.change_ready_state(ReadyState::HaveEnoughData);
                 }
             },
@@ -3094,6 +3152,8 @@ impl HTMLMediaElementMethods<crate::DomTypeHolder> for HTMLMediaElement {
 
     /// <https://html.spec.whatwg.org/multipage/#dom-media-play>
     fn Play(&self, cx: &mut CurrentRealm) -> Rc<Promise> {
+        eprintln!("[DOM-DBG] Play() called, paused={}, error={}",
+            self.Paused(), self.error.get().is_some());
         let promise = Promise::new_in_realm(cx);
 
         // TODO Step 1. If the media element is not allowed to play, then return a promise rejected
@@ -3107,6 +3167,7 @@ impl HTMLMediaElementMethods<crate::DomTypeHolder> for HTMLMediaElement {
             .get()
             .is_some_and(|e| e.Code() == MEDIA_ERR_SRC_NOT_SUPPORTED)
         {
+            eprintln!("[DOM-DBG] Play() rejected: MEDIA_ERR_SRC_NOT_SUPPORTED");
             promise.reject_error(Error::NotSupported(None), CanGc::from_cx(cx));
             return promise;
         }
@@ -3124,6 +3185,7 @@ impl HTMLMediaElementMethods<crate::DomTypeHolder> for HTMLMediaElement {
 
     /// <https://html.spec.whatwg.org/multipage/#dom-media-pause>
     fn Pause(&self, cx: &mut js::context::JSContext) {
+        eprintln!("[DOM-DBG] Pause() called, paused={}", self.Paused());
         // Step 1. If the media element's networkState attribute has the value NETWORK_EMPTY, invoke
         // the media element's resource selection algorithm.
         if self.network_state.get() == NetworkState::Empty {
@@ -4019,6 +4081,7 @@ impl HTMLMediaElementEventHandler {
             return;
         }
 
+        eprintln!("[DOM-DBG] handle_player_event: player_id={}, event={:?}", player_id, event);
         match event {
             PlayerEvent::DurationChanged(duration) => element.playback_duration_changed(duration),
             PlayerEvent::EndOfStream => element.playback_end(),

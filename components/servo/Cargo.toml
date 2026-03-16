@@ -38,6 +38,7 @@ jitspew = ["script/jitspew"]
 js_backtrace = ["script/js_backtrace"]
 js_jit = ["script/js_jit"]
 media-gstreamer = ["servo-media-gstreamer", "gstreamer"]
+media-mpv = ["servo-media-mpv"]
 native-bluetooth = ["bluetooth/native-bluetooth"]
 no-wgl = ["mozangle/egl", "mozangle/build_dlls", "surfman/sm-angle-default", "paint_api/no-wgl"]
 profilemozjs = ["script/profilemozjs"]
@@ -113,6 +114,7 @@ serde = { workspace = true }
 servo-media = { workspace = true }
 servo-media-dummy = { workspace = true }
 servo-media-gstreamer = { workspace = true, optional = true }
+servo-media-mpv = { workspace = true, optional = true }
 servo-tracing = { workspace = true }
 servo_allocator = { package = "servo-allocator", path = "../allocator" }
 servo_config = { package = "servo-config", path = "../config" }
