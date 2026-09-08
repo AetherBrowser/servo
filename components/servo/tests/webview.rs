@@ -12,12 +12,14 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
 use dpi::PhysicalSize;
-use embedder_traits::UrlRequest;
+use embedder_traits::{RefreshDriver, UrlRequest};
+use euclid::default::Size2D as UntypedSize2D;
 use euclid::{Point2D, Size2D};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use http_body_util::combinators::BoxBody;
 use hyper::body::{Bytes, Incoming};
 use hyper::{Request as HyperRequest, Response as HyperResponse};
+use image::RgbaImage;
 use itertools::Itertools;
 use net::test_util::{make_body, make_server, replace_host_table};
 use servo::{
@@ -29,8 +31,9 @@ use servo::{
 };
 use servo_config::prefs::Preferences;
 use servo_url::ServoUrl;
+use surfman::{Error, Surface, SurfaceTexture};
 use url::Url;
-use webrender_api::units::{DeviceIntSize, DevicePoint, DeviceVector2D};
+use webrender_api::units::{DeviceIntRect, DeviceIntSize, DevicePoint, DeviceVector2D};
 
 use crate::common::{
     ServoTest, WebViewDelegateImpl, click_at_point, evaluate_javascript,
@@ -70,6 +73,78 @@ fn test_create_webview() {
     let servo_test = ServoTest::new();
     let delegate = Rc::new(WebViewDelegateImpl::default());
     let webview = WebViewBuilder::new(servo_test.servo(), servo_test.rendering_context.clone())
+        .delegate(delegate.clone())
+        .build();
+
+    servo_test.spin(move || !delegate.url_changed.get());
+
+    let url = webview.url();
+    assert!(url.is_some());
+    assert_eq!(url.unwrap().to_string(), "about:blank");
+}
+
+/// A [`RenderingContext`] that provides no surfman connection, which the trait
+/// permits: `connection()` returns `None`. Every other method must forward to the
+/// inner context; a defaulted `prepare_for_rendering` would bind no framebuffer.
+struct ConnectionlessRenderingContext(Rc<dyn RenderingContext>);
+
+impl RenderingContext for ConnectionlessRenderingContext {
+    fn prepare_for_rendering(&self) {
+        self.0.prepare_for_rendering();
+    }
+
+    fn read_to_image(&self, source_rectangle: DeviceIntRect) -> Option<RgbaImage> {
+        self.0.read_to_image(source_rectangle)
+    }
+
+    fn size(&self) -> PhysicalSize<u32> {
+        self.0.size()
+    }
+
+    fn resize(&self, size: PhysicalSize<u32>) {
+        self.0.resize(size);
+    }
+
+    fn present(&self) {
+        self.0.present();
+    }
+
+    fn make_current(&self) -> Result<(), Error> {
+        self.0.make_current()
+    }
+
+    fn gleam_gl_api(&self) -> Rc<dyn gleam::gl::Gl> {
+        self.0.gleam_gl_api()
+    }
+
+    fn glow_gl_api(&self) -> Arc<glow::Context> {
+        self.0.glow_gl_api()
+    }
+
+    fn create_texture(
+        &self,
+        surface: Surface,
+    ) -> Option<(SurfaceTexture, u32, UntypedSize2D<i32>)> {
+        self.0.create_texture(surface)
+    }
+
+    fn destroy_texture(&self, surface_texture: SurfaceTexture) -> Option<Surface> {
+        self.0.destroy_texture(surface_texture)
+    }
+
+    fn refresh_driver(&self) -> Option<Rc<dyn RefreshDriver>> {
+        self.0.refresh_driver()
+    }
+}
+
+#[test]
+fn test_create_webview_without_surfman_connection() {
+    let servo_test = ServoTest::new();
+    let rendering_context = Rc::new(ConnectionlessRenderingContext(
+        servo_test.rendering_context.clone(),
+    ));
+    let delegate = Rc::new(WebViewDelegateImpl::default());
+    let webview = WebViewBuilder::new(servo_test.servo(), rendering_context)
         .delegate(delegate.clone())
         .build();
 
